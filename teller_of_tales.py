@@ -32,11 +32,13 @@ import gc
 import io
 import json
 import multiprocessing
+import subprocess
 import os
 import pathlib
 import re
 import shutil
 import time
+import sys
 from datetime import datetime
 from typing import (Dict, List, Tuple)
 
@@ -64,6 +66,11 @@ from nltk.tokenize import sent_tokenize, word_tokenize
 from ollama import ChatResponse, chat
 from PIL import Image, PngImagePlugin
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+
 # ---------- MoviePy FFMPEG override ----------
 import moviepy.config as mpy_cfg
 
@@ -79,6 +86,9 @@ DEBUG: bool = config["GENERAL"].getboolean("DEBUG", fallback=False)
 SPEED_UP: bool = config["GENERAL"].getboolean("SPEED_UP", fallback=False)
 FREE_SWAP_GB: int = int(config["GENERAL"]["FREE_SWAP"])
 FPS: int = int(config["GENERAL"]["FPS"])
+AUDIO_ONLY: bool = config["GENERAL"].getboolean("AUDIO_ONLY", fallback=False)
+COMBINE_ALL_PROJECTS: bool = config["GENERAL"].getboolean("COMBINE_ALL_PROJECTS", fallback=False)
+
 
 # TEXT
 FRAGMENT_LENGTH: int = int(config["TEXT_FRAGMENT"]["FRAGMENT_LENGTH"])
@@ -89,6 +99,7 @@ ELEVENLABS_VOICE_ID: str = config["AUDIO"]["ELEVENLABS_VOICE_ID"]
 KOKORO_VOICE_ID: str = config["AUDIO"]["KOKORO_VOICE_ID"]
 KOKORO_URL: str = config["AUDIO"]["KOKORO_URL"]
 VOICE: str = config["AUDIO"]["VOICE"]
+VOICE_SPEED: str = config["AUDIO"]["VOICE_SPEED"]
 BG_MUSIC: bool = config["AUDIO"].getboolean("BG_MUSIC")
 BG_MUSIC_PATH: pathlib.Path = pathlib.Path(__file__).parent / config["AUDIO"]["BG_MUSIC_PATH"]
 MUSIC_VOLUME: float = float(config["AUDIO"]["MUSIC_VOLUME"])
@@ -469,7 +480,7 @@ def tts_kokoro(text: str, out: pathlib.Path) -> None:
             "model": "kokoro",
             "input": text.lower(),
             "voice": KOKORO_VOICE_ID,
-            "speed": 1.0,
+            "speed": VOICE_SPEED,
             "response_format": "wav",
             "stream": True,
         },
@@ -501,18 +512,30 @@ def create_video_clip(idx: int, project_dir: pathlib.Path) -> None:
 
     image_clip = ImageClip(str(img_path)).set_duration(audio_clip.duration)
 
-    # Text overlay
+    # # Text overlay
+    # txt_clip = TextClip(
+    #     _read_text(frag_path),
+    #     fontsize=int(0.06 * IMAGE_HEIGHT),
+    #     font="Impact",
+    #     color="black",
+    #     stroke_color="white",
+    #     stroke_width=round(0.0026 * IMAGE_HEIGHT, 1),
+    #     size=(IMAGE_WIDTH, IMAGE_HEIGHT),
+    #     method="caption",
+    #     align="South",
+    # ).set_duration(audio_clip.duration)
+
     txt_clip = TextClip(
         _read_text(frag_path),
-        fontsize=int(0.06 * IMAGE_HEIGHT),
-        font="Impact",
-        color="black",
-        stroke_color="white",
-        stroke_width=round(0.0026 * IMAGE_HEIGHT, 1),
-        size=(IMAGE_WIDTH, IMAGE_HEIGHT),
+        fontsize=int(0.05 * IMAGE_HEIGHT), # Iets kleiner zodat het mooi in de balk past
+        font="Arial",                      # Beter leesbaar lettertype
+        color="white",                     # Witte letters
+        bg_color="rgba(0, 0, 0, 0.6)",     # Donkere transparante achtergrondbalk
+        size=(IMAGE_WIDTH, int(0.15 * IMAGE_HEIGHT)), # Balk beslaat 15% van de hoogte
         method="caption",
-        align="South",
-    ).set_duration(audio_clip.duration)
+        align="Center",
+    ).set_duration(audio_clip.duration).set_position(("center", "bottom")) 
+
 
     video = CompositeVideoClip([image_clip.set_audio(audio_clip), txt_clip])
     out = project_dir / f"videos/video{idx}.mp4"
@@ -566,15 +589,16 @@ def run_project(project_dir: pathlib.Path) -> None:
         num_frags = len(list(frag_dir.glob("story_fragment*.txt")))
 
     # Generate prompts
-    _unload_sd()
-    _reload_ollama()
-    prompt_dir = project_dir / "text/image_prompts"
-    for idx in range(num_frags):
-        prompt_file = prompt_dir / f"image_prompt{idx}.txt"
-        if not prompt_file.exists():
-            prompt = build_image_prompt(_read_text(frag_dir / f"story_fragment{idx}.txt"))
-            _write_text(prompt_file, prompt)
-            _log(f"Done: image_prompt{idx}")
+    if not AUDIO_ONLY:
+        _unload_sd()
+        _reload_ollama()
+        prompt_dir = project_dir / "text/image_prompts"
+        for idx in range(num_frags):
+            prompt_file = prompt_dir / f"image_prompt{idx}.txt"
+            if not prompt_file.exists():
+                prompt = build_image_prompt(_read_text(frag_dir / f"story_fragment{idx}.txt"))
+                _write_text(prompt_file, prompt)
+                _log(f"Done: image_prompt{idx}")
 
     # Generate audio
     for idx in range(num_frags):
@@ -592,41 +616,247 @@ def run_project(project_dir: pathlib.Path) -> None:
 
 
     # Generate images
-    _unload_ollama()
-    _reload_sd()
-    for idx in range(num_frags):
-        img = project_dir / f"images/image{idx}.jpg"
-        if not img.exists():
-            generate_image(idx, project_dir)
+    if not AUDIO_ONLY:
+        _unload_ollama()
+        _reload_sd()
+        for idx in range(num_frags):
+            img = project_dir / f"images/image{idx}.jpg"
+            if not img.exists():
+                generate_image(idx, project_dir)
 
-    # Generate clips (multi-process for speed)
-    MAX_CORES = min(multiprocessing.cpu_count(), 8)          # cap at 8 
+        # Generate clips (multi-process for speed)
+        MAX_CORES = min(multiprocessing.cpu_count(), 8)          # cap at 8 
+        
+        def _ready(idx: int) -> bool:
+            return (project_dir / f"videos/video{idx}.mp4").exists()
+
+        tasks = [idx for idx in range(num_frags) if not _ready(idx)]
+        if not tasks:
+            _log("All clips already exist – skipping.")
+        else:
+            _log(f"Building {len(tasks)} clips using ≤ {MAX_CORES} processes …")
+
+            with ProcessPoolExecutor(max_workers=MAX_CORES) as pool:
+                for idx in tasks:
+                    pool.submit(create_video_clip, idx, project_dir)
+                    time.sleep(1)
+
+        # Final render
+        final_video = project_dir / f"{project_dir.name}.mp4"
+        if not final_video.exists():
+            make_final_video(project_dir.name, project_dir)
+
+
     
-    def _ready(idx: int) -> bool:
-        return (project_dir / f"videos/video{idx}.mp4").exists()
+    if AUDIO_ONLY:
+        final_audio_path = project_dir / f"{project_dir.name}.mp3"
+        
+        if not final_audio_path.exists():
+            _log("AUDIO_ONLY mode: Concatenating fragments into final MP3...")
+            audio_clips_list = []
+            
+            for idx in range(num_frags):
+                # Try finding the wav first, fallback to mp3 if ElevenLabs was used
+                wav = project_dir / f"audio/voiceover{idx}.wav"
+                mp3 = project_dir / f"audio/voiceover{idx}.mp3"
+                
+                chosen_path = wav if wav.exists() else mp3
+                
+                if chosen_path.exists():
+                    audio_clips_list.append(AudioFileClip(str(chosen_path)))
+                else:
+                    _log(f"Warning: Audio file missing for fragment {idx}")
 
-    tasks = [idx for idx in range(num_frags) if not _ready(idx)]
-    if not tasks:
-        _log("All clips already exist – skipping.")
+            if audio_clips_list:
+                # Merge the voice tracks sequentially
+                final_audio = concatenate_audioclips(audio_clips_list)
+                
+                # Mix in background music if enabled in config
+                if BG_MUSIC and BG_MUSIC_PATH.exists():
+                    _log("Mixing background music into the track...")
+                    bg_clip = AudioFileClip(str(BG_MUSIC_PATH)).fx(volumex, MUSIC_VOLUME)
+                    
+                    if bg_clip.duration < final_audio.duration:
+                        bg_clip = bg_clip.loop(duration=final_audio.duration)
+                    else:
+                        bg_clip = bg_clip.set_duration(final_audio.duration)
+                        
+                    final_audio = CompositeAudioClip([final_audio, bg_clip])
+                
+                # Render to a single combined MP3 file
+                _log(f"Writing final MP3 file: {final_audio_path}")
+                final_audio.write_audiofile(
+                    str(final_audio_path), 
+                    fps=44100, 
+                    bitrate="192k", 
+                    codec="libmp3lame"
+                )
+                _log(f"🎉 Success! Audio book generated at: {final_audio_path}")
+                
+                # Free memory
+                final_audio.close()
+                for clip in audio_clips_list:
+                    clip.close()
+            else:
+                _log("Error: No audio fragment files were found to merge.")
+        else:
+            _log("Final MP3 already exists – skipping render.")
+
+def compile_all_projects_combined(main_projects_dir: pathlib.Path) -> None:
+    """Combines all completed project outputs into one master file.
+    Outputs a native .m4b with baked-in chapters if AUDIO_ONLY is True.
+    """
+    if not COMBINE_ALL_PROJECTS:
+        return
+
+    _log("--- Starting Global Master Compilation ---")
+    
+    # Sorteer mappen alfabetisch/numeriek voor de juiste verhaalvolgorde
+    project_folders = sorted([d for d in main_projects_dir.iterdir() if d.is_dir()])
+    
+    if not project_folders:
+        _log("No project folders found to combine.")
+        return
+
+    if AUDIO_ONLY:
+        master_m4b_path = main_projects_dir / "Master_Audiobook.m4b"
+        temp_audio_path = main_projects_dir / "temp_combined_audio.mp3"
+        metadata_file = main_projects_dir / "ffmetadata.txt"
+        
+        master_clips = []
+        current_time_ms = 0
+        metadata_lines = [";FFMETADATA1\n"]  # FFmpeg metadata header
+
+        _log("Gathering project audio files...")
+        for folder in project_folders:
+            project_mp3 = folder / f"{folder.name}.mp3"
+            if project_mp3.exists():
+                clip = AudioFileClip(str(project_mp3))
+                master_clips.append(clip)
+                
+                # Bereken duur in milliseconden voor FFmpeg hoofdstukken
+                duration_ms = int(clip.duration * 1000)
+                end_time_ms = current_time_ms + duration_ms
+                
+                # Schrijf hoofdstuk-blok voor FFmpeg metadata
+                metadata_lines.append("[CHAPTER]\n")
+                metadata_lines.append("TIMEBASE=1/1000\n")
+                metadata_lines.append(f"START={current_time_ms}\n")
+                metadata_lines.append(f"END={end_time_ms}\n")
+                metadata_lines.append(f"title={folder.name}\n\n")
+                
+                current_time_ms = end_time_ms
+            else:
+                _log(f"Skipping {folder.name}: Final MP3 not found.")
+
+        # (Inside the AUDIO_ONLY branch of compile_all_projects_combined)
+        if master_clips:
+            _log("Merging tracks into a temporary file...")
+            final_audio = concatenate_audioclips(master_clips)
+            final_audio.write_audiofile(
+                str(temp_audio_path),
+                fps=44100,
+                bitrate="192k",
+                codec="libmp3lame"
+            )
+            
+            final_audio.close()
+            for c in master_clips:
+                c.close()
+
+            # Write out metadata configuration file
+            _write_text(metadata_file, "".join(metadata_lines))
+            
+            # --- Check for local cover art asset ---
+            cover_art_path = main_projects_dir / "cover.jpg"
+            
+            # Base FFmpeg command mappings
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-i", str(temp_audio_path),
+                "-i", str(metadata_file),
+            ]
+            
+            # Append cover image mapping parameters if found
+            if cover_art_path.exists():
+                _log("🎨 cover.jpg asset detected! Mapping image stream into M4B...")
+                ffmpeg_cmd.extend(["-i", str(cover_art_path)])
+                
+                # Setup Stream mappings (0=Audio, 1=Metadata, 2=Cover Art Image)
+                mapping_args = [
+                    "-map", "0:a",
+                    "-map", "2:v",  # Map image input directly as a video/visual stream
+                    "-c:v", "mjpeg", # Standard thumbnail stream format
+                    "-disposition:v", "attached_pic" # Flag stream explicitly as album art
+                ]
+            else:
+                _log("No cover.jpg found in project root. Compiling audio-only...")
+                mapping_args = ["-map", "0:a"]
+
+            # Append trailing parameters and codecs
+            ffmpeg_cmd.extend(mapping_args + [
+                "-map_metadata", "1",
+                "-map_chapters", "1",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                str(master_m4b_path)
+            ])
+            
+            # Execute background process pipeline
+            result = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            # Clean up working staging assets
+            if temp_audio_path.exists(): os.remove(temp_audio_path)
+            if metadata_file.exists(): os.remove(metadata_file)
+
+            if result.returncode == 0:
+                _log(f"🎉 Success! Native Audiobook with baked chapters & cover art created: {master_m4b_path}")
+            else:
+                _log(f"FFmpeg Error (Code {result.returncode}): {result.stderr}")
+        else:
+            _log("No project MP3 files were found to combine.")
+
     else:
-        _log(f"Building {len(tasks)} clips using ≤ {MAX_CORES} processes …")
+        # VIDEO COMBINATION PATH (Onveranderd)
+        master_video_path = main_projects_dir / "Master_Movie.mp4"
+        master_videos = []
 
-        with ProcessPoolExecutor(max_workers=MAX_CORES) as pool:
-            for idx in tasks:
-                pool.submit(create_video_clip, idx, project_dir)
-                time.sleep(1)
+        _log("Gathering project video files...")
+        for folder in project_folders:
+            project_mp4 = folder / f"{folder.name}.mp4"
+            if project_mp4.exists():
+                master_videos.append(VideoFileClip(str(project_mp4)))
+            else:
+                _log(f"Skipping {folder.name}: Final MP4 not found.")
 
-    # Final render
-    final_video = project_dir / f"{project_dir.name}.mp4"
-    if not final_video.exists():
-        make_final_video(project_dir.name, project_dir)
+        if master_videos:
+            _log("Merging videos into final Master Movie...")
+            final_master_video = concatenate_videoclips(master_videos, method="compose")
+            final_master_video.write_videofile(
+                str(master_video_path),
+                fps=FPS,
+                codec="libx264",
+                audio_codec="aac"
+            )
+            _log(f"🎉 Master Movie generated: {master_video_path}")
+            
+            final_master_video.close()
+            for v in master_videos:
+                v.close()
+        else:
+            _log("No project MP4 files were found to combine.")
 
 
 if __name__ == "__main__":
     base = pathlib.Path.cwd() / "projects"
     if not base.exists():
         base.mkdir()
+        
+    # 1. Verwerk alle individuele projecten
     for proj in sorted(base.iterdir()):
         if proj.is_dir():
             _log(f"=== Running project {proj.name} ===")
             run_project(proj)
+            
+    # 2. Voeg alle projecten samen als de feature flag aan staat
+    compile_all_projects_combined(base)
